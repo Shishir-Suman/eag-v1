@@ -6,6 +6,9 @@ from clients.gemini_mpc_client import GeminiMCPClient
 import os
 import json
 from prompts.agent_system import AGENT_SYSTEM_INSTRUCTIONS
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Configure logging with a more detailed format
 logging.basicConfig(
@@ -15,45 +18,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+app = FastAPI()
 
-async def process_query(python_mcp_servers: Dict[str, str] = {}) -> dict:
-    """
-    Process user queries through the Gemini MCP client.
-    
-    Args:
-        python_mcp_servers (Dict[str, str]): Dictionary mapping server names to their Python file paths.
-            Defaults to empty dictionary.
-            
-    Returns:
-        dict: The result of processing the query.
-    """
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+class ChatMessage(BaseModel):
+    content: str
+
+class ChatResponse(BaseModel):
+    response: str
+
+# Initialize MCP client and servers
+mcp_client = None
+python_mcp_servers = {
+    "calculator": os.path.join("servers", "calculator/mcp_server.py"),
+    "keynote": os.path.join("servers", "keynote/mcp_server.py"),
+    "email": os.path.join("servers", "email/mcp_server.py"),
+}
+
+@app.on_event("startup")
+async def startup_event():
+    global mcp_client
     logger.info("Initializing Gemini MCP client")
     mcp_client = GeminiMCPClient()
     await mcp_client.connect_to_multiple_servers(python_mcp_servers)
 
-    # Initialize tool schemas and system instructions
-    logger.info("Setting up tool schemas and system instructions")
-    tool_schemas = mcp_client.get_tool_schemas()
-    system_instruction = AGENT_SYSTEM_INSTRUCTIONS.replace("{{tools}}", json.dumps(tool_schemas))
-
-    # Main interaction loop
-    query = input("Enter your query (or 'exit' to quit): ")
-    contents = [types.Content(role="user", parts=[types.Part(text=query)])]
+@app.post("/chat", response_model=ChatResponse)
+async def chat(message: ChatMessage):
+    global mcp_client
+    if not mcp_client:
+        raise HTTPException(status_code=500, detail="MCP client not initialized")
     
-    while query.lower() != 'exit':
-        try:
-            logger.info(f"Processing query: {query}")
-            _ = await run_agent_loop(system_instruction, contents, mcp_client)
-            
-            query = input("Awaiting user input: ")
-            contents.append(types.Content(role="user", parts=[types.Part(text=query)]))
-                
-        except Exception as e:
-            logger.error(f"Error processing query: {str(e)}", exc_info=True)
+    try:
+        # Initialize tool schemas and system instructions
+        tool_schemas = mcp_client.get_tool_schemas()
+        system_instruction = AGENT_SYSTEM_INSTRUCTIONS.replace("{{tools}}", json.dumps(tool_schemas))
         
-    logger.info("Session ended by user")
-    return {}
-
+        # Process the message
+        contents = [types.Content(role="user", parts=[types.Part(text=message.content)])]
+        response = await run_agent_loop(system_instruction, contents, mcp_client)
+        
+        if response:
+            return ChatResponse(response=response)
+        else:
+            return ChatResponse(response="No response generated")
+            
+    except Exception as e:
+        logger.error(f"Error processing chat message: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 def parse_tool_call(tool_call_str: str) -> Tuple[Optional[str], Optional[Dict]]:
     """
@@ -89,7 +108,6 @@ def parse_tool_call(tool_call_str: str) -> Tuple[Optional[str], Optional[Dict]]:
     except Exception as e:
         logger.error(f"Error parsing tool call: {str(e)}", exc_info=True)
         return None, None
-
 
 async def run_agent_loop(
     system_instruction: str,
@@ -132,37 +150,43 @@ async def run_agent_loop(
     if "TOOL_CALL" in response_text:
         tool_name, args = parse_tool_call(response_text)
         function_call = types.FunctionCall(name=tool_name, args=args)
+    
+    validation_call = None
+    if "VALIDATION" in response_text:
+        validation_call = True
+
 
     # Tool interaction loop
     turn_count = 1
     max_tool_turns = 10
 
-    while function_call and turn_count < max_tool_turns:
+    while (function_call or validation_call) and turn_count < max_tool_turns:
         turn_count += 1
-        logger.info(f"Tool turn {turn_count}/{max_tool_turns}")
+        if function_call:
+            logger.info(f"Tool turn {turn_count}/{max_tool_turns}")
 
-        # Process function call
-        tool_name = function_call.name
-        args = function_call.args or {}
-        logger.info(f"Executing tool: '{tool_name}' with args: {args}")
+            # Process function call
+            tool_name = function_call.name
+            args = function_call.args or {}
+            logger.info(f"Executing tool: '{tool_name}' with args: {args}")
 
-        try:
-            tool_result = await mcp_client.execute_tool(function_call)
-            if tool_result.isError:
-                tool_response = {"error": tool_result.content[0].text}
-                logger.error(f"Tool execution failed: {tool_result.content[0].text}")
-            else:
-                tool_response = {"result": tool_result.content[0].text}
-                logger.info("Tool execution successful")
-        except Exception as e:
-            tool_response = {"error": f"Tool execution failed: {type(e).__name__}: {str(e)}"}
-            logger.error(f"Tool execution error: {str(e)}", exc_info=True)
+            try:
+                tool_result = await mcp_client.execute_tool(function_call)
+                if tool_result.isError:
+                    tool_response = {"error": tool_result.content[0].text}
+                    logger.error(f"Tool execution failed: {tool_result.content[0].text}")
+                else:
+                    tool_response = {"result": tool_result.content[0].text}
+                    logger.info("Tool execution successful")
+            except Exception as e:
+                tool_response = {"error": f"Tool execution failed: {type(e).__name__}: {str(e)}"}
+                logger.error(f"Tool execution error: {str(e)}", exc_info=True)
 
-        # Update conversation with tool response
-        contents.append(types.Content(role="user", parts=[types.Part(text=json.dumps(tool_response))]))
+            # Update conversation with tool response
+            contents.append(types.Content(role="user", parts=[types.Part(text=json.dumps(tool_response))]))
 
         # Get next model response
-        logger.info("Requesting model response with tool results")
+        logger.info("Requesting model response with tool results/validation")
         response = await mcp_client.client.aio.models.generate_content(
             model=mcp_client.model,
             contents=contents,
@@ -181,36 +205,26 @@ async def run_agent_loop(
             tool_name, args = parse_tool_call(response_text)
             function_call = types.FunctionCall(name=tool_name, args=args)
 
+        validation_call = None
+        if "VALIDATION" in response_text:
+            validation_call = True
+
         contents.append(response.candidates[0].content)
+        if "FINAL_ANSWER" in response_text:
+            break
 
     if turn_count >= max_tool_turns and function_call:
         logger.warning(f"Maximum tool turns ({max_tool_turns}) reached")
 
     logger.info("Agent loop completed")
-    return 
+    output = contents[-1].parts[0].text
+    if "FINAL_ANSWER" in output:
+        output = output.split("FINAL_ANSWER | ")[-1].strip()
 
-
-async def main() -> None:
-    """
-    Main entry point for the application.
-    Sets up MCP servers and initiates the query processing loop.
-    """
-    logger.info("Starting application")
-    SERVERS_DIR = "servers"
-
-    python_mcp_servers = {
-        "calculator": os.path.join(SERVERS_DIR, "calculator/mcp_server.py"),
-        "keynote": os.path.join(SERVERS_DIR, "keynote/mcp_server.py"),
-        "email": os.path.join(SERVERS_DIR, "email/mcp_server.py"),
-    }
-
-    logger.info("Initializing MCP servers")
-    _ = await process_query(python_mcp_servers)
-    logger.info("Application completed")
-
+    return output
 
 if __name__ == "__main__":
-    logger.info("Starting application in standalone mode")
-    asyncio.run(main())
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
