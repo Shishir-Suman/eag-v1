@@ -22,6 +22,7 @@ A modern chat platform with a FastAPI backend and a responsive frontend interfac
 - Python 3.8 or higher
 - [uv](https://github.com/astral-sh/uv) package manager
 - Google API key (for Gemini AI)
+- Gmail account (for email functionality)
 
 ## Setup
 
@@ -34,14 +35,25 @@ cd <repository-name>
 2. Set up the backend:
 ```bash
 cd backend
-uv sync
+uv venv
+uv pip install -e .
 ```
 
 3. Set up environment variables:
-Create a `.env` file in the backend directory with your Google API key:
+Create a `.env` file in the backend directory with the following variables:
 ```
-GOOGLE_API_KEY=your_api_key_here
+# Gemini AI Configuration
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Email Configuration (required for email functionality)
+SENDER_EMAIL=your_gmail_address
+GMAIL_APP_PASSWORD=your_gmail_app_password
 ```
+
+Note: For Gmail, you'll need to:
+1. Enable 2-Step Verification in your Google Account
+2. Generate an App Password for this application
+3. Use that App Password as the GMAIL_APP_PASSWORD
 
 ## Running the Application
 
@@ -67,6 +79,8 @@ The frontend will be available at `http://localhost:3000`
 - Support for Enter key to send messages
 - Error handling
 - CORS support for secure cross-origin requests
+- Email functionality (requires Gmail configuration)
+- Calculator and Keynote integration
 
 ## API Endpoints
 
@@ -95,6 +109,7 @@ The backend is built with FastAPI and uses the uv package manager for dependency
 - Google's Gemini AI for chat responses
 - Modular server architecture
 - Environment-based configuration
+- Support for multiple tools (calculator, email, keynote)
 
 ### Frontend
 The frontend is a single-page application with:
